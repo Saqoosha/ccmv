@@ -107,11 +107,12 @@ encode_path() {
     echo "$path" | sed 's/[\/: ]/-/g'
 }
 
-# Escape path for sed regex
+# Escape path for sed regex (using | as delimiter)
 escape_sed() {
     local path="$1"
-    # Escape special characters: / \ & . [ ] ^ $ *
-    printf '%s\n' "$path" | sed 's/[\/&.*^$[\\]/\\&/g'
+    # Escape special characters: | \ & . [ ] ^ $ *
+    # Note: / doesn't need escaping since we use | as delimiter
+    printf '%s\n' "$path" | sed 's/[|&.*^$[\\]/\\&/g'
 }
 
 # Rollback function
@@ -245,8 +246,8 @@ move_project() {
     echo ""
 }
 
-# Update JSONL files in Claude projects directory
-update_jsonl_files() {
+# Update all files containing cwd field in Claude projects directory
+update_project_files() {
     local project_dir="${PROJECTS_DIR}/${ENCODED_NEW}"
     local escaped_old
     local escaped_new
@@ -256,25 +257,23 @@ update_jsonl_files() {
         project_dir="${PROJECTS_DIR}/${ENCODED_OLD}"
     fi
 
-    log_info "Updating JSONL files..."
+    log_info "Updating project files..."
 
     escaped_old=$(escape_sed "$OLD_PATH")
     escaped_new=$(escape_sed "$NEW_PATH")
 
-    # Find all JSONL files
-    local jsonl_files
-    jsonl_files=$(find "$project_dir" -name "*.jsonl" -type f 2>/dev/null || true)
+    # Find all files containing the old cwd pattern (includes .jsonl and tool-results/*.txt)
+    local files_with_cwd
+    files_with_cwd=$(grep -rl "\"cwd\":\"${OLD_PATH}\"" "$project_dir" 2>/dev/null || true)
 
-    if [[ -z "$jsonl_files" ]]; then
-        log_info "No JSONL files found"
+    if [[ -z "$files_with_cwd" ]]; then
+        log_info "No files with cwd field found"
         echo ""
         return
     fi
 
     local file
-    for file in $jsonl_files; do
-        local filename
-        filename=$(basename "$file")
+    for file in $files_with_cwd; do
         local relpath="${file#$project_dir/}"
 
         # Count occurrences
@@ -287,8 +286,8 @@ update_jsonl_files() {
             if [[ "$DRY_RUN" == "true" ]]; then
                 log_replace "$count occurrences would be updated"
             else
-                # Perform replacement
-                sed -i '' "s/\"cwd\":\"${escaped_old}\"/\"cwd\":\"${escaped_new}\"/g" "$file"
+                # Perform replacement (using | as delimiter to avoid path escaping issues)
+                sed -i '' "s|\"cwd\":\"${escaped_old}\"|\"cwd\":\"${escaped_new}\"|g" "$file"
                 log_replace "$count occurrences updated"
             fi
         fi
@@ -320,7 +319,7 @@ update_history() {
         if [[ "$DRY_RUN" == "true" ]]; then
             log_replace "$count entries would be updated"
         else
-            sed -i '' "s/\"cwd\":\"${escaped_old}\"/\"cwd\":\"${escaped_new}\"/g" "$HISTORY_FILE"
+            sed -i '' "s|\"cwd\":\"${escaped_old}\"|\"cwd\":\"${escaped_new}\"|g" "$HISTORY_FILE"
             log_replace "$count entries updated"
         fi
     else
@@ -502,7 +501,7 @@ main() {
     create_backup
     move_project
     rename_claude_dir
-    update_jsonl_files
+    update_project_files
     update_history
     verify
     cleanup
