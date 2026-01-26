@@ -1,5 +1,7 @@
 # ccmv
 
+[![npm version](https://img.shields.io/npm/v/ccmv.svg)](https://www.npmjs.com/package/ccmv)
+
 Claude Code project directory migration tool.
 
 ## Problem
