@@ -28,6 +28,19 @@ CLAUDE_DIR="${HOME}/.claude"
 PROJECTS_DIR="${CLAUDE_DIR}/projects"
 HISTORY_FILE="${CLAUDE_DIR}/history.jsonl"
 
+# Cursor specific
+CURSOR_SKIP=false
+CURSOR_DETECTED=false
+CURSOR_APP_SUPPORT="${HOME}/Library/Application Support/Cursor"
+CURSOR_USER_DIR="${CURSOR_APP_SUPPORT}/User"
+CURSOR_GLOBAL_STORAGE="${CURSOR_USER_DIR}/globalStorage"
+CURSOR_WORKSPACE_STORAGE="${CURSOR_USER_DIR}/workspaceStorage"
+CURSOR_STORAGE_JSON="${CURSOR_GLOBAL_STORAGE}/storage.json"
+CURSOR_STATE_VSCDB="${CURSOR_GLOBAL_STORAGE}/state.vscdb"
+OLD_FILE_URI=""
+NEW_FILE_URI=""
+CURSOR_WORKSPACE_DIRS=()
+
 # Logging functions
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -81,11 +94,13 @@ usage() {
 Usage: ccmv [OPTIONS] <old-path> <new-path>
 
 Moves a project directory and updates all Claude Code references.
+If Cursor is installed, also updates Cursor's workspace data automatically.
 
 Options:
   --refs-only    Only update Claude's references (don't move the actual directory)
   --dry-run      Show what would be done without making changes
   --keep-backup  Don't remove backups after successful migration
+  --no-cursor    Skip Cursor data updates even if Cursor is installed
   --verbose      Show detailed logs (default: on)
   --quiet        Suppress detailed logs
   --help         Show this help message
@@ -94,6 +109,7 @@ Examples:
   ccmv /Users/jane/old-project /Users/jane/new-project
   ccmv --dry-run ~/projects/myapp ~/work/myapp
   ccmv --refs-only /old/path /new/path
+  ccmv --no-cursor ~/proj-a ~/proj-b
 
 EOF
     exit 0
@@ -113,6 +129,321 @@ escape_sed() {
     # Escape special characters: | \ & . [ ] ^ $ *
     # Note: / doesn't need escaping since we use | as delimiter
     printf '%s\n' "$path" | sed 's/[|&.*^$[\\]/\\&/g'
+}
+
+# Convert filesystem path to file:// URI with URL encoding
+path_to_file_uri() {
+    local path="$1"
+    python3 -c "from urllib.parse import quote; print('file://' + quote('$path', safe='/'))"
+}
+
+# Detect if Cursor is installed
+detect_cursor() {
+    if [[ "$CURSOR_SKIP" == "true" ]]; then
+        log_info "Cursor update skipped (--no-cursor)"
+        return
+    fi
+
+    if [[ -d "$CURSOR_USER_DIR" ]]; then
+        CURSOR_DETECTED=true
+        log_ok "Cursor detected"
+    else
+        log_info "Cursor not installed, skipping"
+    fi
+}
+
+# Check if Cursor is running
+check_cursor_not_running() {
+    if [[ "$CURSOR_DETECTED" != "true" ]]; then
+        return
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        return
+    fi
+
+    if pgrep -x "Cursor" > /dev/null 2>&1; then
+        log_error "Cursor is running. Please close Cursor before migration to prevent data corruption."
+        exit 1
+    fi
+    log_ok "Cursor is not running"
+}
+
+# Find workspace directories that contain the old path
+find_cursor_workspaces() {
+    if [[ "$CURSOR_DETECTED" != "true" ]]; then
+        return
+    fi
+
+    if [[ ! -d "$CURSOR_WORKSPACE_STORAGE" ]]; then
+        return
+    fi
+
+    log_info "Scanning Cursor workspace storage..."
+
+    # Search for workspace.json files containing our path
+    local workspace_dir
+    for workspace_dir in "$CURSOR_WORKSPACE_STORAGE"/*/; do
+        local workspace_json="${workspace_dir}workspace.json"
+        if [[ -f "$workspace_json" ]]; then
+            # Check both 'folder' and 'workspace' keys (ccdiary approach)
+            if grep -q "$OLD_FILE_URI" "$workspace_json" 2>/dev/null; then
+                CURSOR_WORKSPACE_DIRS+=("$workspace_dir")
+                local dirname
+                dirname=$(basename "$workspace_dir")
+                log_info "  Found workspace: $dirname"
+            fi
+        fi
+    done
+
+    local count=${#CURSOR_WORKSPACE_DIRS[@]}
+    if [[ $count -gt 0 ]]; then
+        log_ok "Found $count workspace directory(s) to update"
+    else
+        log_info "No matching Cursor workspaces found"
+    fi
+}
+
+# Backup Cursor data
+backup_cursor_data() {
+    if [[ "$CURSOR_DETECTED" != "true" ]]; then
+        return
+    fi
+
+    log_backup "Backing up Cursor data..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dryrun "Would backup Cursor data"
+        return
+    fi
+
+    mkdir -p "$BACKUP_DIR/cursor/workspaces"
+
+    # Backup storage.json
+    if [[ -f "$CURSOR_STORAGE_JSON" ]]; then
+        cp "$CURSOR_STORAGE_JSON" "$BACKUP_DIR/cursor/"
+        log_backup "storage.json"
+    fi
+
+    # Backup global state.vscdb
+    if [[ -f "$CURSOR_STATE_VSCDB" ]]; then
+        cp "$CURSOR_STATE_VSCDB" "$BACKUP_DIR/cursor/"
+        log_backup "state.vscdb (global)"
+    fi
+
+    # Backup workspace directories
+    local workspace_dir
+    for workspace_dir in "${CURSOR_WORKSPACE_DIRS[@]}"; do
+        local dirname
+        dirname=$(basename "$workspace_dir")
+        cp -R "$workspace_dir" "$BACKUP_DIR/cursor/workspaces/"
+        log_backup "workspace: $dirname"
+    done
+
+    echo ""
+}
+
+# Update Cursor storage.json
+update_cursor_storage_json() {
+    if [[ "$CURSOR_DETECTED" != "true" ]]; then
+        return
+    fi
+
+    if [[ ! -f "$CURSOR_STORAGE_JSON" ]]; then
+        return
+    fi
+
+    log_info "Updating Cursor storage.json..."
+
+    local escaped_old
+    local escaped_new
+    escaped_old=$(escape_sed "$OLD_FILE_URI")
+    escaped_new=$(escape_sed "$NEW_FILE_URI")
+
+    # Count occurrences
+    local count
+    count=$(grep -c "$OLD_FILE_URI" "$CURSOR_STORAGE_JSON" 2>/dev/null) || count=0
+
+    if [[ "$count" -gt 0 ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_replace "$count occurrences would be updated"
+        else
+            sed -i '' "s|${escaped_old}|${escaped_new}|g" "$CURSOR_STORAGE_JSON"
+            log_replace "$count occurrences updated"
+        fi
+    else
+        log_info "No matching entries in storage.json"
+    fi
+
+    echo ""
+}
+
+# Update Cursor global state.vscdb (SQLite)
+update_cursor_state_vscdb() {
+    if [[ "$CURSOR_DETECTED" != "true" ]]; then
+        return
+    fi
+
+    if [[ ! -f "$CURSOR_STATE_VSCDB" ]]; then
+        return
+    fi
+
+    log_info "Updating Cursor global state.vscdb..."
+
+    # Escape single quotes for SQL
+    local escaped_old="${OLD_FILE_URI//\'/\'\'}"
+    local escaped_new="${NEW_FILE_URI//\'/\'\'}"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        # Count matching rows
+        local count
+        count=$(sqlite3 "$CURSOR_STATE_VSCDB" \
+            "SELECT COUNT(*) FROM ItemTable WHERE value LIKE '%${escaped_old}%';" 2>/dev/null) || count=0
+        log_replace "$count rows would be updated"
+    else
+        sqlite3 "$CURSOR_STATE_VSCDB" << EOF
+BEGIN TRANSACTION;
+UPDATE ItemTable
+SET value = REPLACE(value, '${escaped_old}', '${escaped_new}')
+WHERE value LIKE '%${escaped_old}%';
+COMMIT;
+EOF
+        local count
+        count=$(sqlite3 "$CURSOR_STATE_VSCDB" "SELECT changes();" 2>/dev/null) || count=0
+        log_replace "$count rows updated"
+    fi
+
+    echo ""
+}
+
+# Update Cursor workspace storage
+update_cursor_workspace_storage() {
+    if [[ "$CURSOR_DETECTED" != "true" ]]; then
+        return
+    fi
+
+    if [[ ${#CURSOR_WORKSPACE_DIRS[@]} -eq 0 ]]; then
+        return
+    fi
+
+    log_info "Updating Cursor workspace storage..."
+
+    local escaped_old
+    local escaped_new
+    escaped_old=$(escape_sed "$OLD_FILE_URI")
+    escaped_new=$(escape_sed "$NEW_FILE_URI")
+
+    # SQL escaped versions
+    local sql_escaped_old="${OLD_FILE_URI//\'/\'\'}"
+    local sql_escaped_new="${NEW_FILE_URI//\'/\'\'}"
+
+    local workspace_dir
+    for workspace_dir in "${CURSOR_WORKSPACE_DIRS[@]}"; do
+        local dirname
+        dirname=$(basename "$workspace_dir")
+        log_file "Workspace: $dirname"
+
+        # Update workspace.json
+        local workspace_json="${workspace_dir}workspace.json"
+        if [[ -f "$workspace_json" ]]; then
+            local count
+            count=$(grep -c "$OLD_FILE_URI" "$workspace_json" 2>/dev/null) || count=0
+            if [[ "$count" -gt 0 ]]; then
+                if [[ "$DRY_RUN" == "true" ]]; then
+                    log_replace "workspace.json: $count occurrences would be updated"
+                else
+                    sed -i '' "s|${escaped_old}|${escaped_new}|g" "$workspace_json"
+                    log_replace "workspace.json: $count occurrences updated"
+                fi
+            fi
+        fi
+
+        # Update state.vscdb
+        local state_vscdb="${workspace_dir}state.vscdb"
+        if [[ -f "$state_vscdb" ]]; then
+            if [[ "$DRY_RUN" == "true" ]]; then
+                local count
+                count=$(sqlite3 "$state_vscdb" \
+                    "SELECT COUNT(*) FROM ItemTable WHERE value LIKE '%${sql_escaped_old}%';" 2>/dev/null) || count=0
+                if [[ "$count" -gt 0 ]]; then
+                    log_replace "state.vscdb: $count rows would be updated"
+                fi
+            else
+                sqlite3 "$state_vscdb" << EOF
+BEGIN TRANSACTION;
+UPDATE ItemTable
+SET value = REPLACE(value, '${sql_escaped_old}', '${sql_escaped_new}')
+WHERE value LIKE '%${sql_escaped_old}%';
+COMMIT;
+EOF
+                local count
+                count=$(sqlite3 "$state_vscdb" "SELECT changes();" 2>/dev/null) || count=0
+                if [[ "$count" -gt 0 ]]; then
+                    log_replace "state.vscdb: $count rows updated"
+                fi
+            fi
+        fi
+    done
+
+    echo ""
+}
+
+# Verify Cursor migration
+verify_cursor_migration() {
+    if [[ "$CURSOR_DETECTED" != "true" ]]; then
+        return
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        return
+    fi
+
+    log_info "Verifying Cursor migration..."
+
+    local has_error=false
+
+    # Check storage.json
+    if [[ -f "$CURSOR_STORAGE_JSON" ]]; then
+        local count
+        count=$(grep -c "$OLD_FILE_URI" "$CURSOR_STORAGE_JSON" 2>/dev/null) || count=0
+        if [[ "$count" -gt 0 ]]; then
+            log_error "Found $count stale references in storage.json"
+            has_error=true
+        fi
+    fi
+
+    # Check global state.vscdb
+    if [[ -f "$CURSOR_STATE_VSCDB" ]]; then
+        local escaped_old="${OLD_FILE_URI//\'/\'\'}"
+        local count
+        count=$(sqlite3 "$CURSOR_STATE_VSCDB" \
+            "SELECT COUNT(*) FROM ItemTable WHERE value LIKE '%${escaped_old}%';" 2>/dev/null) || count=0
+        if [[ "$count" -gt 0 ]]; then
+            log_error "Found $count stale references in global state.vscdb"
+            has_error=true
+        fi
+    fi
+
+    # Check workspace directories
+    local workspace_dir
+    for workspace_dir in "${CURSOR_WORKSPACE_DIRS[@]}"; do
+        local workspace_json="${workspace_dir}workspace.json"
+        if [[ -f "$workspace_json" ]]; then
+            local count
+            count=$(grep -c "$OLD_FILE_URI" "$workspace_json" 2>/dev/null) || count=0
+            if [[ "$count" -gt 0 ]]; then
+                log_error "Found $count stale references in $(basename "$workspace_dir")/workspace.json"
+                has_error=true
+            fi
+        fi
+    done
+
+    if [[ "$has_error" == "true" ]]; then
+        return 1
+    fi
+
+    log_ok "Cursor migration verified"
+    echo ""
 }
 
 # Rollback function
@@ -149,6 +480,32 @@ rollback() {
         if [[ -d "$NEW_PATH" ]] && [[ ! -d "$OLD_PATH" ]]; then
             mv "$NEW_PATH" "$OLD_PATH"
             log_rollback "Moved project back to original location"
+        fi
+    fi
+
+    # Restore Cursor data
+    if [[ "$CURSOR_DETECTED" == "true" ]]; then
+        if [[ -f "$BACKUP_DIR/cursor/storage.json" ]]; then
+            cp "$BACKUP_DIR/cursor/storage.json" "$CURSOR_STORAGE_JSON"
+            log_rollback "Restored Cursor storage.json"
+        fi
+        if [[ -f "$BACKUP_DIR/cursor/state.vscdb" ]]; then
+            cp "$BACKUP_DIR/cursor/state.vscdb" "$CURSOR_STATE_VSCDB"
+            log_rollback "Restored Cursor global state.vscdb"
+        fi
+        # Restore workspace directories
+        if [[ -d "$BACKUP_DIR/cursor/workspaces" ]]; then
+            local backup_workspace
+            for backup_workspace in "$BACKUP_DIR/cursor/workspaces"/*/; do
+                if [[ -d "$backup_workspace" ]]; then
+                    local dirname
+                    dirname=$(basename "$backup_workspace")
+                    local target_dir="${CURSOR_WORKSPACE_STORAGE}/${dirname}"
+                    rm -rf "$target_dir"
+                    cp -R "$backup_workspace" "$target_dir"
+                    log_rollback "Restored Cursor workspace: $dirname"
+                fi
+            done
         fi
     fi
 
@@ -436,6 +793,10 @@ main() {
                 VERBOSE=false
                 shift
                 ;;
+            --no-cursor)
+                CURSOR_SKIP=true
+                shift
+                ;;
             --help|-h)
                 usage
                 ;;
@@ -474,6 +835,10 @@ main() {
     ENCODED_OLD=$(encode_path "$OLD_PATH")
     ENCODED_NEW=$(encode_path "$NEW_PATH")
 
+    # Generate file:// URIs for Cursor
+    OLD_FILE_URI=$(path_to_file_uri "$OLD_PATH")
+    NEW_FILE_URI=$(path_to_file_uri "$NEW_PATH")
+
     # Display info
     echo ""
     log_info "Old path: $OLD_PATH"
@@ -498,12 +863,20 @@ main() {
 
     # Execute migration steps
     validate
+    detect_cursor
+    check_cursor_not_running
+    find_cursor_workspaces
     create_backup
+    backup_cursor_data
     move_project
     rename_claude_dir
     update_project_files
     update_history
+    update_cursor_storage_json
+    update_cursor_state_vscdb
+    update_cursor_workspace_storage
     verify
+    verify_cursor_migration
     cleanup
 
     # Disable trap on success

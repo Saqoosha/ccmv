@@ -8,7 +8,7 @@ When you move a project directory, Claude Code loses track of your conversation 
 
 ## Solution
 
-`ccmv` moves your project and updates all Claude Code references automatically.
+`ccmv` moves your project and updates all Claude Code references automatically. If Cursor editor is installed, it also updates Cursor's workspace data.
 
 ## Installation
 
@@ -30,6 +30,7 @@ Options:
   --refs-only    Only update references (don't move directory)
   --dry-run      Preview changes without executing
   --keep-backup  Keep backup after successful migration
+  --no-cursor    Skip Cursor editor data updates
   --quiet        Suppress detailed output
   --help         Show help
 ```
@@ -49,13 +50,18 @@ ccmv --refs-only /old/path /new/path
 
 ## What It Does
 
-1. Creates backup of Claude data
+1. Creates backup of Claude data (and Cursor data if installed)
 2. Moves project directory (unless `--refs-only`)
 3. Renames `~/.claude/projects/{encoded-path}/`
 4. Updates `cwd` field in all JSONL files
 5. Updates `~/.claude/history.jsonl`
-6. Verifies migration success
-7. Auto-rollback on any failure
+6. Updates Cursor workspace data (if installed)
+   - `storage.json` (profile associations)
+   - `state.vscdb` (global SQLite database)
+   - `workspaceStorage/*/workspace.json`
+   - `workspaceStorage/*/state.vscdb`
+7. Verifies migration success
+8. Auto-rollback on any failure
 
 ## How Claude Code Stores Data
 
@@ -70,6 +76,23 @@ ccmv --refs-only /old/path /new/path
 ```
 
 Path encoding: `/Users/jane/foo bar` → `-Users-jane-foo-bar`
+
+## Cursor Data (Auto-detected)
+
+If Cursor is installed, `ccmv` also updates:
+
+```
+~/Library/Application Support/Cursor/User/
+├── globalStorage/
+│   ├── storage.json          # Profile workspace associations
+│   └── state.vscdb           # SQLite: history, repository paths
+└── workspaceStorage/
+    └── {hash}/
+        ├── workspace.json    # Workspace folder URI
+        └── state.vscdb       # Workspace-specific data
+```
+
+**Note:** Cursor must be closed during migration to prevent data corruption.
 
 ## Requirements
 
