@@ -39,6 +39,8 @@ CURSOR_STORAGE_JSON="${CURSOR_GLOBAL_STORAGE}/storage.json"
 CURSOR_STATE_VSCDB="${CURSOR_GLOBAL_STORAGE}/state.vscdb"
 OLD_FILE_URI=""
 NEW_FILE_URI=""
+OLD_WORKSPACE_HASH=""
+NEW_WORKSPACE_HASH=""
 CURSOR_WORKSPACE_DIRS=()
 
 # Logging functions
@@ -137,6 +139,30 @@ path_to_file_uri() {
     python3 -c "from urllib.parse import quote; print('file://' + quote('$path', safe='/'))"
 }
 
+# Calculate VSCode/Cursor workspace hash from path
+# Hash = MD5(path + birthtime_ms)
+get_workspace_hash() {
+    local path="$1"
+    if [[ ! -d "$path" ]]; then
+        echo ""
+        return
+    fi
+    node -e "
+const fs = require('fs');
+const crypto = require('crypto');
+try {
+    const stat = fs.statSync('$path');
+    const hash = crypto.createHash('md5')
+        .update('$path')
+        .update(String(stat.birthtime.getTime()))
+        .digest('hex');
+    console.log(hash);
+} catch (e) {
+    process.exit(1);
+}
+" 2>/dev/null
+}
+
 # Detect if Cursor is installed
 detect_cursor() {
     if [[ "$CURSOR_SKIP" == "true" ]]; then
@@ -169,7 +195,7 @@ check_cursor_not_running() {
     log_ok "Cursor is not running"
 }
 
-# Find workspace directories that contain the old path
+# Find workspace directories using hash calculation
 find_cursor_workspaces() {
     if [[ "$CURSOR_DETECTED" != "true" ]]; then
         return
@@ -179,28 +205,147 @@ find_cursor_workspaces() {
         return
     fi
 
-    log_info "Scanning Cursor workspace storage..."
+    log_info "Calculating workspace hash..."
 
-    # Search for workspace.json files containing our path
+    # Calculate hash from old path
+    OLD_WORKSPACE_HASH=$(get_workspace_hash "$OLD_PATH")
+
+    if [[ -z "$OLD_WORKSPACE_HASH" ]]; then
+        log_info "Could not calculate workspace hash"
+        return
+    fi
+
+    log_info "  Old path hash: $OLD_WORKSPACE_HASH"
+
+    local workspace_dir="${CURSOR_WORKSPACE_STORAGE}/${OLD_WORKSPACE_HASH}"
+    if [[ -d "$workspace_dir" ]]; then
+        CURSOR_WORKSPACE_DIRS+=("$workspace_dir/")
+        log_ok "Found workspace directory: $OLD_WORKSPACE_HASH"
+    else
+        log_info "No matching Cursor workspace found for this path"
+    fi
+}
+
+# Rename Cursor workspace storage directory
+rename_cursor_workspace() {
+    if [[ "$CURSOR_DETECTED" != "true" ]]; then
+        return
+    fi
+
+    if [[ -z "$OLD_WORKSPACE_HASH" ]]; then
+        return
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dryrun "Would rename workspace directory (hash calculated after move)"
+        return
+    fi
+
+    log_info "Calculating new workspace hash..."
+
+    # Calculate hash from new path (after project move, birthtime is preserved)
+    NEW_WORKSPACE_HASH=$(get_workspace_hash "$NEW_PATH")
+
+    if [[ -z "$NEW_WORKSPACE_HASH" ]]; then
+        log_error "Could not calculate new workspace hash"
+        return 1
+    fi
+
+    log_info "  New path hash: $NEW_WORKSPACE_HASH"
+
+    local old_ws_dir="${CURSOR_WORKSPACE_STORAGE}/${OLD_WORKSPACE_HASH}"
+    local new_ws_dir="${CURSOR_WORKSPACE_STORAGE}/${NEW_WORKSPACE_HASH}"
+
+    if [[ "$OLD_WORKSPACE_HASH" == "$NEW_WORKSPACE_HASH" ]]; then
+        log_info "Workspace hash unchanged (same birthtime)"
+        return
+    fi
+
+    if [[ -d "$old_ws_dir" ]]; then
+        if [[ -d "$new_ws_dir" ]]; then
+            log_info "Target workspace directory already exists, merging..."
+            # Compare state.vscdb sizes and keep the larger one (more data)
+            local old_db="$old_ws_dir/state.vscdb"
+            local new_db="$new_ws_dir/state.vscdb"
+            if [[ -f "$old_db" ]] && [[ -f "$new_db" ]]; then
+                local old_size=$(stat -f%z "$old_db" 2>/dev/null || echo 0)
+                local new_size=$(stat -f%z "$new_db" 2>/dev/null || echo 0)
+                if [[ "$old_size" -gt "$new_size" ]]; then
+                    log_info "  Using larger state.vscdb from old workspace ($old_size > $new_size bytes)"
+                    cp "$old_db" "$new_db"
+                fi
+            elif [[ -f "$old_db" ]]; then
+                cp "$old_db" "$new_db"
+            fi
+            # Copy other files from old (don't overwrite existing)
+            cp -Rn "$old_ws_dir"/* "$new_ws_dir"/ 2>/dev/null || true
+            rm -rf "$old_ws_dir"
+        else
+            mv "$old_ws_dir" "$new_ws_dir"
+        fi
+        # Update CURSOR_WORKSPACE_DIRS to point to new location
+        CURSOR_WORKSPACE_DIRS=("$new_ws_dir/")
+        log_ok "Renamed workspace directory"
+    fi
+
+    # Find and merge any other workspaces pointing to the new path
+    merge_duplicate_workspaces
+}
+
+# Merge duplicate workspaces pointing to the same path
+merge_duplicate_workspaces() {
+    if [[ -z "$NEW_WORKSPACE_HASH" ]]; then
+        return
+    fi
+
+    local target_dir="${CURSOR_WORKSPACE_STORAGE}/${NEW_WORKSPACE_HASH}"
+    if [[ ! -d "$target_dir" ]]; then
+        return
+    fi
+
+    log_info "Checking for duplicate workspaces..."
+
+    local found_duplicates=false
     local workspace_dir
     for workspace_dir in "$CURSOR_WORKSPACE_STORAGE"/*/; do
+        local hash
+        hash=$(basename "$workspace_dir")
+
+        # Skip the target directory itself
+        if [[ "$hash" == "$NEW_WORKSPACE_HASH" ]]; then
+            continue
+        fi
+
         local workspace_json="${workspace_dir}workspace.json"
         if [[ -f "$workspace_json" ]]; then
-            # Check both 'folder' and 'workspace' keys (ccdiary approach)
-            if grep -q "$OLD_FILE_URI" "$workspace_json" 2>/dev/null; then
-                CURSOR_WORKSPACE_DIRS+=("$workspace_dir")
-                local dirname
-                dirname=$(basename "$workspace_dir")
-                log_info "  Found workspace: $dirname"
+            # Check if this workspace points to our new path
+            if grep -q "$NEW_FILE_URI" "$workspace_json" 2>/dev/null; then
+                found_duplicates=true
+                log_info "  Found duplicate workspace: $hash"
+
+                # Compare state.vscdb and merge if the duplicate has more data
+                local dup_db="${workspace_dir}state.vscdb"
+                local target_db="${target_dir}/state.vscdb"
+
+                if [[ -f "$dup_db" ]]; then
+                    local dup_size=$(stat -f%z "$dup_db" 2>/dev/null || echo 0)
+                    local target_size=$(stat -f%z "$target_db" 2>/dev/null || echo 0)
+
+                    if [[ "$dup_size" -gt "$target_size" ]]; then
+                        log_info "  Merging larger state.vscdb ($dup_size > $target_size bytes)"
+                        cp "$dup_db" "$target_db"
+                    fi
+                fi
+
+                # Remove the duplicate workspace
+                rm -rf "$workspace_dir"
+                log_ok "  Removed duplicate workspace"
             fi
         fi
     done
 
-    local count=${#CURSOR_WORKSPACE_DIRS[@]}
-    if [[ $count -gt 0 ]]; then
-        log_ok "Found $count workspace directory(s) to update"
-    else
-        log_info "No matching Cursor workspaces found"
+    if [[ "$found_duplicates" == "false" ]]; then
+        log_info "  No duplicates found"
     fi
 }
 
@@ -236,7 +381,9 @@ backup_cursor_data() {
     for workspace_dir in "${CURSOR_WORKSPACE_DIRS[@]}"; do
         local dirname
         dirname=$(basename "$workspace_dir")
-        cp -R "$workspace_dir" "$BACKUP_DIR/cursor/workspaces/"
+        # Remove trailing slash to copy directory itself, not contents
+        local ws_path="${workspace_dir%/}"
+        cp -R "$ws_path" "$BACKUP_DIR/cursor/workspaces/"
         log_backup "workspace: $dirname"
     done
 
@@ -255,20 +402,45 @@ update_cursor_storage_json() {
 
     log_info "Updating Cursor storage.json..."
 
-    local escaped_old
-    local escaped_new
-    escaped_old=$(escape_sed "$OLD_FILE_URI")
-    escaped_new=$(escape_sed "$NEW_FILE_URI")
+    # Multiple path formats used in storage.json:
+    # 1. file:// URI: file:///Users/foo/project
+    # 2. Absolute path: /Users/foo/project
+    # 3. Tilde path: ~/Documents/repos/project (relative to $HOME)
+    local old_tilde_path="${OLD_PATH/#$HOME/\~}"
+    local new_tilde_path="${NEW_PATH/#$HOME/\~}"
 
-    # Count occurrences
+    local escaped_old_uri escaped_new_uri
+    local escaped_old_path escaped_new_path
+    local escaped_old_tilde escaped_new_tilde
+    escaped_old_uri=$(escape_sed "$OLD_FILE_URI")
+    escaped_new_uri=$(escape_sed "$NEW_FILE_URI")
+    escaped_old_path=$(escape_sed "$OLD_PATH")
+    escaped_new_path=$(escape_sed "$NEW_PATH")
+    escaped_old_tilde=$(escape_sed "$old_tilde_path")
+    escaped_new_tilde=$(escape_sed "$new_tilde_path")
+
+    # Count all occurrences (any path format)
     local count
-    count=$(grep -c "$OLD_FILE_URI" "$CURSOR_STORAGE_JSON" 2>/dev/null) || count=0
+    count=$(grep -c -E "$OLD_PATH|$OLD_FILE_URI" "$CURSOR_STORAGE_JSON" 2>/dev/null) || count=0
 
     if [[ "$count" -gt 0 ]]; then
         if [[ "$DRY_RUN" == "true" ]]; then
             log_replace "$count occurrences would be updated"
         else
-            sed -i '' "s|${escaped_old}|${escaped_new}|g" "$CURSOR_STORAGE_JSON"
+            # Replace path formats with delimiters to avoid partial matches
+            # (e.g., "SPNFY" shouldn't match "SPNFY-test")
+            # Match path followed by: " (JSON string end), / (path sep), , (JSON sep)
+            sed -i '' \
+                -e "s|${escaped_old_uri}\"|${escaped_new_uri}\"|g" \
+                -e "s|${escaped_old_uri}/|${escaped_new_uri}/|g" \
+                -e "s|${escaped_old_uri},|${escaped_new_uri},|g" \
+                -e "s|${escaped_old_path}\"|${escaped_new_path}\"|g" \
+                -e "s|${escaped_old_path}/|${escaped_new_path}/|g" \
+                -e "s|${escaped_old_path},|${escaped_new_path},|g" \
+                -e "s|${escaped_old_tilde}\"|${escaped_new_tilde}\"|g" \
+                -e "s|${escaped_old_tilde}/|${escaped_new_tilde}/|g" \
+                -e "s|${escaped_old_tilde},|${escaped_new_tilde},|g" \
+                "$CURSOR_STORAGE_JSON"
             log_replace "$count occurrences updated"
         fi
     else
@@ -290,27 +462,45 @@ update_cursor_state_vscdb() {
 
     log_info "Updating Cursor global state.vscdb..."
 
-    # Escape single quotes for SQL
-    local escaped_old="${OLD_FILE_URI//\'/\'\'}"
-    local escaped_new="${NEW_FILE_URI//\'/\'\'}"
+    # Multiple path formats - escape single quotes for SQL
+    local old_tilde_path="${OLD_PATH/#$HOME/\~}"
+    local new_tilde_path="${NEW_PATH/#$HOME/\~}"
+
+    local escaped_old_uri="${OLD_FILE_URI//\'/\'\'}"
+    local escaped_new_uri="${NEW_FILE_URI//\'/\'\'}"
+    local escaped_old_path="${OLD_PATH//\'/\'\'}"
+    local escaped_new_path="${NEW_PATH//\'/\'\'}"
+    local escaped_old_tilde="${old_tilde_path//\'/\'\'}"
+    local escaped_new_tilde="${new_tilde_path//\'/\'\'}"
+
+    # Count matching rows first (any path format)
+    local count
+    count=$(sqlite3 "$CURSOR_STATE_VSCDB" \
+        "SELECT COUNT(*) FROM ItemTable WHERE value LIKE '%${escaped_old_path}%';" 2>/dev/null) || count=0
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        # Count matching rows
-        local count
-        count=$(sqlite3 "$CURSOR_STATE_VSCDB" \
-            "SELECT COUNT(*) FROM ItemTable WHERE value LIKE '%${escaped_old}%';" 2>/dev/null) || count=0
         log_replace "$count rows would be updated"
     else
-        sqlite3 "$CURSOR_STATE_VSCDB" << EOF
+        if [[ "$count" -gt 0 ]]; then
+            # Replace path formats with delimiters to avoid partial matches
+            # Match path followed by: " (JSON string end), / (path sep), , (JSON sep)
+            sqlite3 "$CURSOR_STATE_VSCDB" << EOF
 BEGIN TRANSACTION;
-UPDATE ItemTable
-SET value = REPLACE(value, '${escaped_old}', '${escaped_new}')
-WHERE value LIKE '%${escaped_old}%';
+UPDATE ItemTable SET value = REPLACE(value, '${escaped_old_uri}"', '${escaped_new_uri}"') WHERE value LIKE '%${escaped_old_uri}"%';
+UPDATE ItemTable SET value = REPLACE(value, '${escaped_old_uri}/', '${escaped_new_uri}/') WHERE value LIKE '%${escaped_old_uri}/%';
+UPDATE ItemTable SET value = REPLACE(value, '${escaped_old_uri},', '${escaped_new_uri},') WHERE value LIKE '%${escaped_old_uri},%';
+UPDATE ItemTable SET value = REPLACE(value, '${escaped_old_path}"', '${escaped_new_path}"') WHERE value LIKE '%${escaped_old_path}"%';
+UPDATE ItemTable SET value = REPLACE(value, '${escaped_old_path}/', '${escaped_new_path}/') WHERE value LIKE '%${escaped_old_path}/%';
+UPDATE ItemTable SET value = REPLACE(value, '${escaped_old_path},', '${escaped_new_path},') WHERE value LIKE '%${escaped_old_path},%';
+UPDATE ItemTable SET value = REPLACE(value, '${escaped_old_tilde}"', '${escaped_new_tilde}"') WHERE value LIKE '%${escaped_old_tilde}"%';
+UPDATE ItemTable SET value = REPLACE(value, '${escaped_old_tilde}/', '${escaped_new_tilde}/') WHERE value LIKE '%${escaped_old_tilde}/%';
+UPDATE ItemTable SET value = REPLACE(value, '${escaped_old_tilde},', '${escaped_new_tilde},') WHERE value LIKE '%${escaped_old_tilde},%';
 COMMIT;
 EOF
-        local count
-        count=$(sqlite3 "$CURSOR_STATE_VSCDB" "SELECT changes();" 2>/dev/null) || count=0
-        log_replace "$count rows updated"
+            log_replace "$count rows updated"
+        else
+            log_info "No matching entries in global state.vscdb"
+        fi
     fi
 
     echo ""
@@ -328,14 +518,28 @@ update_cursor_workspace_storage() {
 
     log_info "Updating Cursor workspace storage..."
 
-    local escaped_old
-    local escaped_new
-    escaped_old=$(escape_sed "$OLD_FILE_URI")
-    escaped_new=$(escape_sed "$NEW_FILE_URI")
+    # Multiple path formats
+    local old_tilde_path="${OLD_PATH/#$HOME/\~}"
+    local new_tilde_path="${NEW_PATH/#$HOME/\~}"
+
+    # sed escaped versions
+    local escaped_old_uri escaped_new_uri
+    local escaped_old_path escaped_new_path
+    local escaped_old_tilde escaped_new_tilde
+    escaped_old_uri=$(escape_sed "$OLD_FILE_URI")
+    escaped_new_uri=$(escape_sed "$NEW_FILE_URI")
+    escaped_old_path=$(escape_sed "$OLD_PATH")
+    escaped_new_path=$(escape_sed "$NEW_PATH")
+    escaped_old_tilde=$(escape_sed "$old_tilde_path")
+    escaped_new_tilde=$(escape_sed "$new_tilde_path")
 
     # SQL escaped versions
-    local sql_escaped_old="${OLD_FILE_URI//\'/\'\'}"
-    local sql_escaped_new="${NEW_FILE_URI//\'/\'\'}"
+    local sql_escaped_old_uri="${OLD_FILE_URI//\'/\'\'}"
+    local sql_escaped_new_uri="${NEW_FILE_URI//\'/\'\'}"
+    local sql_escaped_old_path="${OLD_PATH//\'/\'\'}"
+    local sql_escaped_new_path="${NEW_PATH//\'/\'\'}"
+    local sql_escaped_old_tilde="${old_tilde_path//\'/\'\'}"
+    local sql_escaped_new_tilde="${new_tilde_path//\'/\'\'}"
 
     local workspace_dir
     for workspace_dir in "${CURSOR_WORKSPACE_DIRS[@]}"; do
@@ -347,12 +551,20 @@ update_cursor_workspace_storage() {
         local workspace_json="${workspace_dir}workspace.json"
         if [[ -f "$workspace_json" ]]; then
             local count
-            count=$(grep -c "$OLD_FILE_URI" "$workspace_json" 2>/dev/null) || count=0
+            count=$(grep -c -E "$OLD_PATH|$OLD_FILE_URI" "$workspace_json" 2>/dev/null) || count=0
             if [[ "$count" -gt 0 ]]; then
                 if [[ "$DRY_RUN" == "true" ]]; then
                     log_replace "workspace.json: $count occurrences would be updated"
                 else
-                    sed -i '' "s|${escaped_old}|${escaped_new}|g" "$workspace_json"
+                    # Replace with delimiters to avoid partial matches
+                    sed -i '' \
+                        -e "s|${escaped_old_uri}\"|${escaped_new_uri}\"|g" \
+                        -e "s|${escaped_old_uri}/|${escaped_new_uri}/|g" \
+                        -e "s|${escaped_old_path}\"|${escaped_new_path}\"|g" \
+                        -e "s|${escaped_old_path}/|${escaped_new_path}/|g" \
+                        -e "s|${escaped_old_tilde}\"|${escaped_new_tilde}\"|g" \
+                        -e "s|${escaped_old_tilde}/|${escaped_new_tilde}/|g" \
+                        "$workspace_json"
                     log_replace "workspace.json: $count occurrences updated"
                 fi
             fi
@@ -361,25 +573,25 @@ update_cursor_workspace_storage() {
         # Update state.vscdb
         local state_vscdb="${workspace_dir}state.vscdb"
         if [[ -f "$state_vscdb" ]]; then
-            if [[ "$DRY_RUN" == "true" ]]; then
-                local count
-                count=$(sqlite3 "$state_vscdb" \
-                    "SELECT COUNT(*) FROM ItemTable WHERE value LIKE '%${sql_escaped_old}%';" 2>/dev/null) || count=0
-                if [[ "$count" -gt 0 ]]; then
-                    log_replace "state.vscdb: $count rows would be updated"
-                fi
-            else
-                sqlite3 "$state_vscdb" << EOF
+            local db_count
+            db_count=$(sqlite3 "$state_vscdb" \
+                "SELECT COUNT(*) FROM ItemTable WHERE value LIKE '%${sql_escaped_old_path}%';" 2>/dev/null) || db_count=0
+            if [[ "$db_count" -gt 0 ]]; then
+                if [[ "$DRY_RUN" == "true" ]]; then
+                    log_replace "state.vscdb: $db_count rows would be updated"
+                else
+                    # Replace with delimiters to avoid partial matches
+                    sqlite3 "$state_vscdb" << EOF
 BEGIN TRANSACTION;
-UPDATE ItemTable
-SET value = REPLACE(value, '${sql_escaped_old}', '${sql_escaped_new}')
-WHERE value LIKE '%${sql_escaped_old}%';
+UPDATE ItemTable SET value = REPLACE(value, '${sql_escaped_old_uri}"', '${sql_escaped_new_uri}"') WHERE value LIKE '%${sql_escaped_old_uri}"%';
+UPDATE ItemTable SET value = REPLACE(value, '${sql_escaped_old_uri}/', '${sql_escaped_new_uri}/') WHERE value LIKE '%${sql_escaped_old_uri}/%';
+UPDATE ItemTable SET value = REPLACE(value, '${sql_escaped_old_path}"', '${sql_escaped_new_path}"') WHERE value LIKE '%${sql_escaped_old_path}"%';
+UPDATE ItemTable SET value = REPLACE(value, '${sql_escaped_old_path}/', '${sql_escaped_new_path}/') WHERE value LIKE '%${sql_escaped_old_path}/%';
+UPDATE ItemTable SET value = REPLACE(value, '${sql_escaped_old_tilde}"', '${sql_escaped_new_tilde}"') WHERE value LIKE '%${sql_escaped_old_tilde}"%';
+UPDATE ItemTable SET value = REPLACE(value, '${sql_escaped_old_tilde}/', '${sql_escaped_new_tilde}/') WHERE value LIKE '%${sql_escaped_old_tilde}/%';
 COMMIT;
 EOF
-                local count
-                count=$(sqlite3 "$state_vscdb" "SELECT changes();" 2>/dev/null) || count=0
-                if [[ "$count" -gt 0 ]]; then
-                    log_replace "state.vscdb: $count rows updated"
+                    log_replace "state.vscdb: $db_count rows updated"
                 fi
             fi
         fi
@@ -402,22 +614,26 @@ verify_cursor_migration() {
 
     local has_error=false
 
-    # Check storage.json
+    # Use OLD_PATH for verification, but exclude matches that are part of NEW_PATH
+    # (e.g., OLD_PATH="SPNFY" should not match "SPNFY-test")
+    local escaped_old_path="${OLD_PATH//\'/\'\'}"
+    local escaped_new_path="${NEW_PATH//\'/\'\'}"
+
+    # Check storage.json - find OLD_PATH but exclude lines with NEW_PATH
     if [[ -f "$CURSOR_STORAGE_JSON" ]]; then
         local count
-        count=$(grep -c "$OLD_FILE_URI" "$CURSOR_STORAGE_JSON" 2>/dev/null) || count=0
+        count=$(grep "$OLD_PATH" "$CURSOR_STORAGE_JSON" 2>/dev/null | grep -cv "$NEW_PATH" 2>/dev/null) || count=0
         if [[ "$count" -gt 0 ]]; then
             log_error "Found $count stale references in storage.json"
             has_error=true
         fi
     fi
 
-    # Check global state.vscdb
+    # Check global state.vscdb - find OLD_PATH but exclude rows with NEW_PATH
     if [[ -f "$CURSOR_STATE_VSCDB" ]]; then
-        local escaped_old="${OLD_FILE_URI//\'/\'\'}"
         local count
         count=$(sqlite3 "$CURSOR_STATE_VSCDB" \
-            "SELECT COUNT(*) FROM ItemTable WHERE value LIKE '%${escaped_old}%';" 2>/dev/null) || count=0
+            "SELECT COUNT(*) FROM ItemTable WHERE value LIKE '%${escaped_old_path}%' AND value NOT LIKE '%${escaped_new_path}%';" 2>/dev/null) || count=0
         if [[ "$count" -gt 0 ]]; then
             log_error "Found $count stale references in global state.vscdb"
             has_error=true
@@ -430,7 +646,7 @@ verify_cursor_migration() {
         local workspace_json="${workspace_dir}workspace.json"
         if [[ -f "$workspace_json" ]]; then
             local count
-            count=$(grep -c "$OLD_FILE_URI" "$workspace_json" 2>/dev/null) || count=0
+            count=$(grep "$OLD_PATH" "$workspace_json" 2>/dev/null | grep -cv "$NEW_PATH" 2>/dev/null) || count=0
             if [[ "$count" -gt 0 ]]; then
                 log_error "Found $count stale references in $(basename "$workspace_dir")/workspace.json"
                 has_error=true
@@ -869,6 +1085,7 @@ main() {
     create_backup
     backup_cursor_data
     move_project
+    rename_cursor_workspace
     rename_claude_dir
     update_project_files
     update_history
