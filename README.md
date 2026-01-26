@@ -13,12 +13,11 @@ When you move a project directory, Claude Code loses track of your conversation 
 ## Installation
 
 ```bash
-# Download
-curl -O https://raw.githubusercontent.com/saqoosha/ccmv/main/ccmv
-chmod +x ccmv
+# Using npm (recommended)
+npm install -g ccmv
 
-# Add to PATH
-mv ccmv /usr/local/bin/
+# Or using npx (no installation required)
+npx ccmv --help
 ```
 
 ## Usage
@@ -40,6 +39,9 @@ Options:
 ```bash
 # Move project to new location
 ccmv ~/projects/myapp ~/work/myapp
+
+# Or using npx
+npx ccmv ~/projects/myapp ~/work/myapp
 
 # Preview what would happen
 ccmv --dry-run ~/old-project ~/new-project
@@ -96,9 +98,8 @@ If Cursor is installed, `ccmv` also updates:
 
 ## Requirements
 
+- Node.js 18.0.0 or later
 - macOS or Linux
-- Bash 4.0+
-- Python 3 (for JSON validation)
 
 ## License
 
