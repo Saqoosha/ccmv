@@ -2,7 +2,12 @@
 
 ## Overview
 
-`ccmv` is a Node.js CLI tool that migrates Claude Code project directories, updating all internal references when a project is moved to a new location. Also supports Cursor editor (auto-detected).
+`ccmv` is a Node.js CLI tool that migrates project directories, updating all Claude Code and/or Cursor references when a project is moved to a new location.
+
+**Supported configurations:**
+- Claude Code + Cursor (both)
+- Claude Code only
+- Cursor only
 
 ## Project Structure
 
@@ -84,6 +89,7 @@ const hash = createHash('md5')
 ### Error Handling
 
 - Validates all paths before making changes
+- Requires at least one of Claude Code or Cursor data (fails if neither exists)
 - Creates backups before any modifications
 - Auto-rollback on any error during migration
 - Cursor must not be running (checked before migration)
