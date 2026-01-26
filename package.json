@@ -1,0 +1,36 @@
+{
+  "name": "ccmv",
+  "version": "1.0.1",
+  "description": "Claude Code project directory migration tool",
+  "type": "module",
+  "main": "lib/index.js",
+  "bin": {
+    "ccmv": "bin/ccmv.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "migration",
+    "cursor",
+    "vscode"
+  ],
+  "author": "Saqoosha",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/saqoosha/ccmv.git"
+  },
+  "bugs": {
+    "url": "https://github.com/saqoosha/ccmv/issues"
+  },
+  "homepage": "https://github.com/saqoosha/ccmv#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0"
+  }
+}

@@ -8,17 +8,19 @@ When you move a project directory, Claude Code loses track of your conversation 
 
 ## Solution
 
-`ccmv` moves your project and updates all Claude Code references automatically. If Cursor editor is installed, it also updates Cursor's workspace data.
+`ccmv` moves your project and updates all Claude Code and/or Cursor references automatically. Works with:
+- Projects with both Claude Code and Cursor data
+- Claude Code-only projects (no Cursor)
+- Cursor-only projects (no Claude Code history)
 
 ## Installation
 
 ```bash
-# Download
-curl -O https://raw.githubusercontent.com/saqoosha/ccmv/main/ccmv
-chmod +x ccmv
+# Using npm (recommended)
+npm install -g ccmv
 
-# Add to PATH
-mv ccmv /usr/local/bin/
+# Or using npx (no installation required)
+npx ccmv --help
 ```
 
 ## Usage
@@ -41,6 +43,9 @@ Options:
 # Move project to new location
 ccmv ~/projects/myapp ~/work/myapp
 
+# Or using npx
+npx ccmv ~/projects/myapp ~/work/myapp
+
 # Preview what would happen
 ccmv --dry-run ~/old-project ~/new-project
 
@@ -50,18 +55,23 @@ ccmv --refs-only /old/path /new/path
 
 ## What It Does
 
-1. Creates backup of Claude data (and Cursor data if installed)
-2. Moves project directory (unless `--refs-only`)
-3. Renames `~/.claude/projects/{encoded-path}/`
-4. Updates `cwd` field in all JSONL files
-5. Updates `~/.claude/history.jsonl`
-6. Updates Cursor workspace data (if installed)
-   - `storage.json` (profile associations)
-   - `state.vscdb` (global SQLite database)
-   - `workspaceStorage/*/workspace.json`
-   - `workspaceStorage/*/state.vscdb`
-7. Verifies migration success
-8. Auto-rollback on any failure
+1. Detects Claude Code and/or Cursor data for the project
+2. Creates backup of existing data
+3. Moves project directory (unless `--refs-only`)
+4. Updates Claude Code data (if exists):
+   - Renames `~/.claude/projects/{encoded-path}/`
+   - Updates `cwd` field in all JSONL files
+   - Updates `~/.claude/history.jsonl`
+5. Updates Cursor workspace data (if exists):
+   - Renames `workspaceStorage/{hash}/` directory
+   - Updates `storage.json` (profile associations)
+   - Updates `state.vscdb` (global SQLite database)
+   - Updates `workspaceStorage/*/workspace.json`
+   - Updates `workspaceStorage/*/state.vscdb`
+6. Verifies migration success
+7. Auto-rollback on any failure
+
+**Note:** Migration requires at least one of Claude Code or Cursor data to exist. If neither exists, use regular `mv` command.
 
 ## How Claude Code Stores Data
 
@@ -96,9 +106,8 @@ If Cursor is installed, `ccmv` also updates:
 
 ## Requirements
 
+- Node.js 18.0.0 or later
 - macOS or Linux
-- Bash 4.0+
-- Python 3 (for JSON validation)
 
 ## License
 
