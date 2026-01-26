@@ -1,0 +1,523 @@
+#!/bin/bash
+
+# ccmv: Claude Code Project Directory Migration Tool
+# Moves a project directory and updates all Claude Code references
+
+set -euo pipefail
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Default options
+DRY_RUN=false
+REFS_ONLY=false
+KEEP_BACKUP=false
+VERBOSE=true
+
+# Globals
+BACKUP_DIR=""
+OLD_PATH=""
+NEW_PATH=""
+ENCODED_OLD=""
+ENCODED_NEW=""
+CLAUDE_DIR="${HOME}/.claude"
+PROJECTS_DIR="${CLAUDE_DIR}/projects"
+HISTORY_FILE="${CLAUDE_DIR}/history.jsonl"
+
+# Logging functions
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+log_ok() {
+    echo -e "${GREEN}[OK]${NC} $1"
+}
+
+log_check() {
+    echo -e "${YELLOW}[CHECK]${NC} $1"
+}
+
+log_backup() {
+    echo -e "${YELLOW}[BACKUP]${NC} $1"
+}
+
+log_file() {
+    echo -e "${BLUE}[FILE]${NC} $1"
+}
+
+log_replace() {
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo -e "  ${GREEN}[REPLACE]${NC} $1"
+    fi
+}
+
+log_rename() {
+    echo -e "${BLUE}[RENAME]${NC} $1"
+}
+
+log_done() {
+    echo -e "${GREEN}[DONE]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+log_rollback() {
+    echo -e "${YELLOW}[ROLLBACK]${NC} $1"
+}
+
+log_dryrun() {
+    echo -e "${YELLOW}[DRY-RUN]${NC} $1"
+}
+
+# Show usage
+usage() {
+    cat << EOF
+Usage: ccmv [OPTIONS] <old-path> <new-path>
+
+Moves a project directory and updates all Claude Code references.
+
+Options:
+  --refs-only    Only update Claude's references (don't move the actual directory)
+  --dry-run      Show what would be done without making changes
+  --keep-backup  Don't remove backups after successful migration
+  --verbose      Show detailed logs (default: on)
+  --quiet        Suppress detailed logs
+  --help         Show this help message
+
+Examples:
+  ccmv /Users/jane/old-project /Users/jane/new-project
+  ccmv --dry-run ~/projects/myapp ~/work/myapp
+  ccmv --refs-only /old/path /new/path
+
+EOF
+    exit 0
+}
+
+# Encode path for Claude projects directory
+# Rule: / -> -, : -> -, space -> -
+encode_path() {
+    local path="$1"
+    # Replace /, :, and space with -
+    echo "$path" | sed 's/[\/: ]/-/g'
+}
+
+# Escape path for sed regex
+escape_sed() {
+    local path="$1"
+    # Escape special characters: / \ & . [ ] ^ $ *
+    printf '%s\n' "$path" | sed 's/[\/&.*^$[\\]/\\&/g'
+}
+
+# Rollback function
+rollback() {
+    local exit_code=$?
+
+    if [[ -z "$BACKUP_DIR" ]] || [[ ! -d "$BACKUP_DIR" ]]; then
+        log_error "No backup available for rollback"
+        exit 1
+    fi
+
+    log_error "Migration failed! Rolling back..."
+
+    # Restore history.jsonl
+    if [[ -f "$BACKUP_DIR/history.jsonl" ]]; then
+        cp "$BACKUP_DIR/history.jsonl" "$HISTORY_FILE"
+        log_rollback "Restored history.jsonl"
+    fi
+
+    # Restore project dir if it was renamed
+    local old_project_dir="${PROJECTS_DIR}/${ENCODED_OLD}"
+    local new_project_dir="${PROJECTS_DIR}/${ENCODED_NEW}"
+
+    if [[ -d "$BACKUP_DIR/projects/${ENCODED_OLD}" ]]; then
+        if [[ -d "$new_project_dir" ]]; then
+            rm -rf "$new_project_dir"
+        fi
+        cp -R "$BACKUP_DIR/projects/${ENCODED_OLD}" "$old_project_dir"
+        log_rollback "Restored project directory"
+    fi
+
+    # Restore original project location if moved
+    if [[ "$REFS_ONLY" != "true" ]]; then
+        if [[ -d "$NEW_PATH" ]] && [[ ! -d "$OLD_PATH" ]]; then
+            mv "$NEW_PATH" "$OLD_PATH"
+            log_rollback "Moved project back to original location"
+        fi
+    fi
+
+    log_rollback "Complete. Your project is unchanged."
+    echo ""
+    echo "Backup kept at: $BACKUP_DIR"
+
+    exit "$exit_code"
+}
+
+# Validate paths and environment
+validate() {
+    log_check "Validating paths..."
+
+    # Check old path exists
+    if [[ ! -d "$OLD_PATH" ]]; then
+        if [[ "$REFS_ONLY" == "true" ]]; then
+            log_info "Old path doesn't exist (OK for --refs-only mode)"
+        else
+            log_error "Old path does not exist: $OLD_PATH"
+            exit 1
+        fi
+    else
+        log_ok "Old path exists"
+    fi
+
+    # Check new path doesn't exist (unless refs-only)
+    if [[ "$REFS_ONLY" != "true" ]]; then
+        if [[ -e "$NEW_PATH" ]]; then
+            log_error "New path already exists: $NEW_PATH"
+            exit 1
+        fi
+        log_ok "New path does not exist"
+    fi
+
+    # Check Claude project dir exists
+    local old_project_dir="${PROJECTS_DIR}/${ENCODED_OLD}"
+    if [[ -d "$old_project_dir" ]]; then
+        log_ok "Claude project dir exists: ${old_project_dir/#$HOME/\~}/"
+    else
+        log_error "Claude project directory not found: ${old_project_dir/#$HOME/\~}/"
+        log_error "This project may not have any Claude Code history."
+        exit 1
+    fi
+
+    echo ""
+}
+
+# Create backups
+create_backup() {
+    local timestamp
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    BACKUP_DIR="${CLAUDE_DIR}/backups/ccmv-${timestamp}"
+
+    log_backup "Creating backups..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dryrun "Would create backup at: ${BACKUP_DIR/#$HOME/\~}/"
+        return
+    fi
+
+    mkdir -p "$BACKUP_DIR/projects"
+
+    # Backup project directory
+    local old_project_dir="${PROJECTS_DIR}/${ENCODED_OLD}"
+    if [[ -d "$old_project_dir" ]]; then
+        cp -R "$old_project_dir" "$BACKUP_DIR/projects/"
+        log_backup "${old_project_dir/#$HOME/\~}/ -> ${BACKUP_DIR/#$HOME/\~}/projects/"
+    fi
+
+    # Backup history.jsonl
+    if [[ -f "$HISTORY_FILE" ]]; then
+        cp "$HISTORY_FILE" "$BACKUP_DIR/"
+        log_backup "${HISTORY_FILE/#$HOME/\~} -> ${BACKUP_DIR/#$HOME/\~}/history.jsonl"
+    fi
+
+    echo ""
+}
+
+# Move the actual project directory
+move_project() {
+    if [[ "$REFS_ONLY" == "true" ]]; then
+        return
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dryrun "Would move: $OLD_PATH -> $NEW_PATH"
+        echo ""
+        return
+    fi
+
+    log_info "Moving project directory..."
+    mv "$OLD_PATH" "$NEW_PATH"
+    log_ok "Moved: $OLD_PATH -> $NEW_PATH"
+    echo ""
+}
+
+# Update JSONL files in Claude projects directory
+update_jsonl_files() {
+    local project_dir="${PROJECTS_DIR}/${ENCODED_NEW}"
+    local escaped_old
+    local escaped_new
+
+    # For dry-run, use old path since rename hasn't happened yet
+    if [[ "$DRY_RUN" == "true" ]]; then
+        project_dir="${PROJECTS_DIR}/${ENCODED_OLD}"
+    fi
+
+    log_info "Updating JSONL files..."
+
+    escaped_old=$(escape_sed "$OLD_PATH")
+    escaped_new=$(escape_sed "$NEW_PATH")
+
+    # Find all JSONL files
+    local jsonl_files
+    jsonl_files=$(find "$project_dir" -name "*.jsonl" -type f 2>/dev/null || true)
+
+    if [[ -z "$jsonl_files" ]]; then
+        log_info "No JSONL files found"
+        echo ""
+        return
+    fi
+
+    local file
+    for file in $jsonl_files; do
+        local filename
+        filename=$(basename "$file")
+        local relpath="${file#$project_dir/}"
+
+        # Count occurrences
+        local count
+        count=$(grep -c "\"cwd\":\"${OLD_PATH}\"" "$file" 2>/dev/null) || count=0
+
+        if [[ "$count" -gt 0 ]]; then
+            log_file "$relpath"
+
+            if [[ "$DRY_RUN" == "true" ]]; then
+                log_replace "$count occurrences would be updated"
+            else
+                # Perform replacement
+                sed -i '' "s/\"cwd\":\"${escaped_old}\"/\"cwd\":\"${escaped_new}\"/g" "$file"
+                log_replace "$count occurrences updated"
+            fi
+        fi
+    done
+
+    echo ""
+}
+
+# Update global history file
+update_history() {
+    if [[ ! -f "$HISTORY_FILE" ]]; then
+        log_info "No global history file found"
+        echo ""
+        return
+    fi
+
+    log_info "Updating global history..."
+
+    local escaped_old
+    local escaped_new
+    escaped_old=$(escape_sed "$OLD_PATH")
+    escaped_new=$(escape_sed "$NEW_PATH")
+
+    # Count occurrences
+    local count
+    count=$(grep -c "\"cwd\":\"${OLD_PATH}\"" "$HISTORY_FILE" 2>/dev/null) || count=0
+
+    if [[ "$count" -gt 0 ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_replace "$count entries would be updated"
+        else
+            sed -i '' "s/\"cwd\":\"${escaped_old}\"/\"cwd\":\"${escaped_new}\"/g" "$HISTORY_FILE"
+            log_replace "$count entries updated"
+        fi
+    else
+        log_info "No matching entries found in history"
+    fi
+
+    echo ""
+}
+
+# Rename Claude projects directory
+rename_claude_dir() {
+    local old_project_dir="${PROJECTS_DIR}/${ENCODED_OLD}"
+    local new_project_dir="${PROJECTS_DIR}/${ENCODED_NEW}"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dryrun "Would rename: ${old_project_dir/#$HOME/\~}/ -> ${new_project_dir/#$HOME/\~}/"
+        echo ""
+        return
+    fi
+
+    log_rename "${old_project_dir/#$HOME/\~}/ -> ${new_project_dir/#$HOME/\~}/"
+    mv "$old_project_dir" "$new_project_dir"
+
+    echo ""
+}
+
+# Verify the migration
+verify() {
+    log_info "Verifying migration..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dryrun "Verification skipped in dry-run mode"
+        echo ""
+        return
+    fi
+
+    local new_project_dir="${PROJECTS_DIR}/${ENCODED_NEW}"
+
+    # Check new Claude projects dir exists
+    if [[ -d "$new_project_dir" ]]; then
+        log_ok "New Claude project dir exists"
+    else
+        log_error "New Claude project dir not found!"
+        return 1
+    fi
+
+    # Check JSONL files are valid (spot check first file)
+    local first_jsonl
+    first_jsonl=$(find "$new_project_dir" -name "*.jsonl" -type f | head -1)
+
+    if [[ -n "$first_jsonl" ]]; then
+        # Try to parse first line as JSON
+        if head -1 "$first_jsonl" | python3 -m json.tool > /dev/null 2>&1; then
+            log_ok "JSONL files appear valid"
+        else
+            log_error "JSONL file may be corrupted: $first_jsonl"
+            return 1
+        fi
+    fi
+
+    # Verify no old path references remain
+    local remaining
+    remaining=$(grep -rc "\"cwd\":\"${OLD_PATH}\"" "$new_project_dir" 2>/dev/null | awk -F: '{sum += $2} END {print sum+0}') || remaining=0
+
+    if [[ "$remaining" -gt 0 ]]; then
+        log_error "Found $remaining remaining references to old path!"
+        return 1
+    fi
+    log_ok "No stale path references found"
+
+    echo ""
+}
+
+# Cleanup backups
+cleanup() {
+    if [[ "$DRY_RUN" == "true" ]]; then
+        return
+    fi
+
+    if [[ "$KEEP_BACKUP" == "true" ]]; then
+        log_info "Backup kept at: ${BACKUP_DIR/#$HOME/\~}/"
+    else
+        if [[ -n "$BACKUP_DIR" ]] && [[ -d "$BACKUP_DIR" ]]; then
+            rm -rf "$BACKUP_DIR"
+            log_info "Backup removed"
+        fi
+    fi
+}
+
+# Main function
+main() {
+    # Parse arguments
+    local positional=()
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --refs-only)
+                REFS_ONLY=true
+                shift
+                ;;
+            --keep-backup)
+                KEEP_BACKUP=true
+                shift
+                ;;
+            --verbose)
+                VERBOSE=true
+                shift
+                ;;
+            --quiet)
+                VERBOSE=false
+                shift
+                ;;
+            --help|-h)
+                usage
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 1
+                ;;
+            *)
+                positional+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    # Check positional arguments
+    if [[ ${#positional[@]} -ne 2 ]]; then
+        log_error "Expected 2 arguments: old-path and new-path"
+        echo "Use --help for usage information"
+        exit 1
+    fi
+
+    # Resolve to absolute paths
+    OLD_PATH=$(cd "$(dirname "${positional[0]}")" 2>/dev/null && pwd)/$(basename "${positional[0]}")
+    OLD_PATH="${OLD_PATH%/}"  # Remove trailing slash
+
+    # For new path, we can't cd into it (it doesn't exist), so resolve parent
+    local new_parent
+    local new_name
+    new_parent=$(cd "$(dirname "${positional[1]}")" 2>/dev/null && pwd)
+    new_name=$(basename "${positional[1]}")
+    NEW_PATH="${new_parent}/${new_name}"
+    NEW_PATH="${NEW_PATH%/}"  # Remove trailing slash
+
+    # Encode paths
+    ENCODED_OLD=$(encode_path "$OLD_PATH")
+    ENCODED_NEW=$(encode_path "$NEW_PATH")
+
+    # Display info
+    echo ""
+    log_info "Old path: $OLD_PATH"
+    log_info "New path: $NEW_PATH"
+    log_info "Encoded old: $ENCODED_OLD"
+    log_info "Encoded new: $ENCODED_NEW"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo ""
+        log_dryrun "Running in dry-run mode - no changes will be made"
+    fi
+
+    if [[ "$REFS_ONLY" == "true" ]]; then
+        echo ""
+        log_info "Running in refs-only mode - project directory will not be moved"
+    fi
+
+    echo ""
+
+    # Set up error trap for rollback
+    trap 'rollback' ERR
+
+    # Execute migration steps
+    validate
+    create_backup
+    move_project
+    rename_claude_dir
+    update_jsonl_files
+    update_history
+    verify
+    cleanup
+
+    # Disable trap on success
+    trap - ERR
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_done "Dry-run complete! No changes were made."
+    else
+        log_done "Migration complete!"
+        if [[ "$REFS_ONLY" != "true" ]]; then
+            log_info "Your project is now at: $NEW_PATH"
+        fi
+    fi
+}
+
+main "$@"
