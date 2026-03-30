@@ -31,7 +31,9 @@ ccmv/
 ### Claude Code Data Locations
 
 - `~/.claude/projects/{encoded-path}/` - Project-specific session data
-- `~/.claude/history.jsonl` - Global history file
+- `~/.claude/projects/{encoded-path}/sessions-index.json` - Session index (fullPath, projectPath, originalPath)
+- `~/.claude/sessions/*.json` - Active session metadata (contains `cwd` field)
+- `~/.claude/history.jsonl` - Global history file (`project` field, not `cwd`)
 - Path encoding: `/`, `:`, spaces → `-`
 
 ### Cursor Data Locations
@@ -82,7 +84,7 @@ const hash = createHash('md5')
 |--------|---------|
 | `lib/index.js` | CLI parsing, orchestration, rollback handling |
 | `lib/logger.js` | Colored log output functions |
-| `lib/utils.js` | `encodePath`, `pathToFileUri`, `getWorkspaceHash`, `resolvePath` |
+| `lib/utils.js` | `encodePath`, `pathToFileUri`, `getWorkspaceHash`, `resolvePath`, `writeFilePreserveMtime` |
 | `lib/claude.js` | Backup, rename, update, verify Claude data |
 | `lib/cursor.js` | Detect, backup, update Cursor storage.json and SQLite DBs |
 
@@ -134,6 +136,7 @@ ccmv --help
 ### Known Issues
 
 - Cursor must be closed during migration (enforced by `checkCursorNotRunning`)
+- **Do not migrate ccmv's own directory** while running from it — the process loses its cwd after `renameSync`. Use `--refs-only` and move the directory manually instead
 - **Cross-volume moves**: `mv` to different volume may not preserve birthtime, potentially breaking hash prediction (untested)
 - On Linux, Cursor data is at `~/.config/Cursor/User/` instead of `~/Library/Application Support/`
 

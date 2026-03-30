@@ -63,7 +63,9 @@ ccmv --refs-only /old/path /new/path
 4. Updates Claude Code data (if exists):
    - Renames `~/.claude/projects/{encoded-path}/`
    - Updates `cwd` field in all JSONL files
-   - Updates `~/.claude/history.jsonl`
+   - Updates `project` field in `~/.claude/history.jsonl`
+   - Updates `cwd` in `~/.claude/sessions/*.json`
+   - Updates `sessions-index.json` (fullPath, projectPath, originalPath)
 5. Updates Cursor workspace data (if exists):
    - Renames `workspaceStorage/{hash}/` directory
    - Updates `storage.json` (profile associations)
@@ -82,9 +84,12 @@ ccmv --refs-only /old/path /new/path
 ├── projects/
 │   └── -Users-jane-myproject/    # Encoded from /Users/jane/myproject
 │       ├── session-abc.jsonl     # Contains "cwd":"/Users/jane/myproject"
+│       ├── sessions-index.json   # Session index with fullPath, projectPath
 │       └── subagents/
 │           └── agent-xyz.jsonl
-└── history.jsonl                  # Global history with cwd fields
+├── sessions/                      # Active session metadata
+│   └── 12345.json                 # Contains "cwd":"/Users/jane/myproject"
+└── history.jsonl                  # Global history with "project" field
 ```
 
 Path encoding: `/Users/jane/foo bar` → `-Users-jane-foo-bar`

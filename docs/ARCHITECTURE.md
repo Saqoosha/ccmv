@@ -12,8 +12,11 @@ This document provides detailed documentation of the internal data structures us
 │   └── {encoded-path}/          # Encoded path (see below)
 │       ├── {session-id}.jsonl   # Main session file
 │       ├── agent-{agent-id}.jsonl  # Sub-agent sessions
+│       ├── sessions-index.json  # Session index (fullPath, projectPath, originalPath)
 │       └── tool-results/        # Tool execution result cache
 │           └── *.txt
+├── sessions/                    # Active session metadata
+│   └── {pid}.json               # Per-process session info (cwd, sessionId, etc.)
 ├── history.jsonl                # Global history (all projects)
 ├── file-history/                # File change history
 ├── backups/                     # Backups from ccmv etc.
@@ -132,6 +135,49 @@ Sub-agent sessions (launched via Task tool) are stored in separate files.
   ...
 }
 ```
+
+### Session Metadata (~/.claude/sessions/*.json)
+
+Per-process session metadata files, named by PID:
+
+```json
+{
+  "pid": 12345,
+  "sessionId": "0c1c6b33-5703-4c42-afd8-739ba2332d78",
+  "cwd": "/Users/jane/project",
+  "startedAt": 1774855549101,
+  "kind": "interactive",
+  "entrypoint": "cli"
+}
+```
+
+### Sessions Index (sessions-index.json)
+
+Located inside each project directory. Indexes sessions with metadata:
+
+```json
+{
+  "version": 1,
+  "entries": [
+    {
+      "sessionId": "cc4e3386-4331-4a06-8309-e19f251139b5",
+      "fullPath": "/Users/jane/.claude/projects/-Users-jane-project/cc4e3386.jsonl",
+      "fileMtime": 1769500777863,
+      "firstPrompt": "pull latest",
+      "summary": "...",
+      "messageCount": 3,
+      "projectPath": "/Users/jane/project",
+      "isSidechain": false
+    }
+  ],
+  "originalPath": "/Users/jane/project"
+}
+```
+
+**Fields requiring update during migration:**
+- `fullPath` — contains encoded project directory path
+- `projectPath` — raw project path
+- `originalPath` — raw project path
 
 ### Global History (history.jsonl)
 
@@ -303,9 +349,11 @@ CREATE TABLE cursorDiskKV (
 8. rename_cursor_workspace - Rename workspace directory
 9. rename_claude_dir  - Rename Claude project directory
 10. update_project_files - Update cwd in session files
-11. update_history    - Update history.jsonl
-12. update_cursor_*   - Update various Cursor files
-13. verify            - Verify migration
+11. update_history    - Update "project" field in history.jsonl
+12. update_sessions   - Update cwd in ~/.claude/sessions/*.json
+13. update_sessions_index - Update sessions-index.json paths
+14. update_cursor_*   - Update various Cursor files
+15. verify            - Verify migration
 ```
 
 ### Key Update Points
@@ -317,6 +365,8 @@ CREATE TABLE cursorDiskKV (
 | `~/.claude/projects/{encoded-old}/` | Rename directory |
 | `cwd` field in `*.jsonl` | String replacement |
 | `project` field in `history.jsonl` | String replacement |
+| `cwd` field in `~/.claude/sessions/*.json` | String replacement |
+| `sessions-index.json` | Update fullPath, projectPath, originalPath |
 
 #### Cursor
 
